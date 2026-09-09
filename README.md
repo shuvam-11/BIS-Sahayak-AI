@@ -1,20 +1,54 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# BIS Sahayak AI
 
-# Run and deploy your AI Studio app
+AI-Powered Intelligent Assistant for Indian Standards and BIS Services.
 
-This contains everything you need to run your app locally.
+## About
 
-View your app in AI Studio: https://ai.studio/apps/324aeea7-8a89-4c12-aba7-ca69d5885214
+BIS Sahayak AI is an intelligent platform designed to help users access and understand BIS standards and BIS-related services through an easy-to-use interface.
 
-## Run Locally
+## Features
 
-**Prerequisites:**  Node.js
+- AI Assistant
+- Find My Standard
+- BIS Certification Guide
+- Testing & Laboratory Assistant
+- Hallmarking & HUID Assistance
+- Consumer Help
+- BIS Knowledge Base
+- Source or Refuse
 
+## Technologies
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+- React.js
+- TypeScript / JavaScript
+- Vite
+- Tailwind CSS
+- Node.js
+- Express.js
+- Google Gemini API
+- RAG-based AI
+- Git / GitHub
+- Vercel
+
+## Project
+
+**Smart India Hackathon 2026**  
+**Problem Statement: SIH26107**
+
+## Core Principle
+
+### Source or Refuse
+
+The system is designed to provide information when supporting BIS evidence is available and avoid unsupported responses when sufficient verified information is unavailable.
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js
+- npm
+
+### Installation
+
+```bash
+npm install
