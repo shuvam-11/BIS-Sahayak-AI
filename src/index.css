@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bis-navy: #020617;
+  --color-bis-navy-card: #0f172a;
+  --color-bis-navy-dark: #111827;
+  --color-bis-border: #1e293b;
+  --color-bis-blue: #264796;
+  --color-bis-blue-hover: #2f56b5;
+  --color-bis-blue-dark: #1b326b;
+  --color-bis-blue-light: #3b60bf;
+  --color-bis-slate: #cbd5e1;
+  --color-bis-muted: #94a3b8;
+  --color-bis-emerald: #10b981;
+  --color-bis-amber: #f59e0b;
+  --color-bis-red: #ef4444;
+  --color-bis-saffron: #f59e0b;
+  --color-bis-indian-green: #138808;
+}
+

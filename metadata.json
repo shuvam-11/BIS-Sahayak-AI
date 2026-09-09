@@ -1,0 +1,6 @@
+{
+  "name": "BIS Sahayak AI",
+  "description": "AI-Powered Intelligent Guide for Indian Standards & BIS Services for Industries and Consumers (Smart India Hackathon PS 26107)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
