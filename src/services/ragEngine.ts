@@ -1,12 +1,26 @@
 /**
  * BIS Sahayak AI - RAG Retrieval & Verification Engine
- * Implements: Hybrid Search (Semantic/Intent + Keyword), Source or Refuse,
- * Three Levels of Reliability (VERIFIED, NEEDS VERIFICATION, NOT VERIFIED),
- * Intelligent Follow-up Detection, and Clause-backed Citations.
+ *
+ * Implements:
+ * - Hybrid keyword + intent/product search
+ * - Product-specific relevance ranking
+ * - Source-grounded answers
+ * - Follow-up detection
+ * - Reliability levels
+ * - Clause-backed citations
+ *
+ * Important:
+ * This engine only retrieves from the local BIS knowledge base.
+ * It does not claim live BIS database access.
  */
 
 import { BIS_STANDARDS, BIS_LABORATORIES } from '../data/bisKnowledgeBase';
-import { BISStandard, StructuredAIResponse, ReliabilityLevel, ProductUnderstanding } from '../types';
+import {
+  BISStandard,
+  StructuredAIResponse,
+  ReliabilityLevel,
+  ProductUnderstanding
+} from '../types';
 
 export interface SearchMatch {
   standard: BISStandard;
@@ -16,70 +30,555 @@ export interface SearchMatch {
   relevanceExplanation: string;
 }
 
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+function normalizeText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[–—]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function containsPhrase(text: string, phrase: string): boolean {
+  return normalizeText(text).includes(normalizeText(phrase));
+}
+
+function standardSearchText(std: BISStandard): string {
+  return normalizeText(
+    [
+      std.standardNumber,
+      std.title,
+      std.category,
+      std.scopeSummary,
+      ...std.productsCovered,
+      ...std.keywords
+    ].join(' ')
+  );
+}
+
+/* ============================================================
+   PRODUCT INTENT
+   ============================================================ */
+
+type ProductIntent =
+  | 'electric-kettle'
+  | 'water-bottle'
+  | 'pressure-cooker'
+  | 'helmet'
+  | 'led-lamp'
+  | 'packaged-water'
+  | 'toy'
+  | 'gold-jewellery'
+  | 'plug-socket'
+  | 'cement'
+  | 'cable'
+  | null;
+
+function detectProductIntent(query: string): ProductIntent {
+  const lower = normalizeText(query);
+
+  // IMPORTANT:
+  // Electric kettle must be checked before generic electrical
+  // appliance detection.
+  if (
+    lower.includes('electric kettle') ||
+    lower.includes('electric water kettle') ||
+    lower.includes('kettle jug') ||
+    lower.includes('electric jug')
+  ) {
+    return 'electric-kettle';
+  }
+
+  if (
+    lower.includes('water bottle') ||
+    lower.includes('vacuum flask') ||
+    lower.includes('thermos') ||
+    lower.includes('flask')
+  ) {
+    return 'water-bottle';
+  }
+
+  if (
+    lower.includes('pressure cooker') ||
+    lower.includes('pressure-cooker')
+  ) {
+    return 'pressure-cooker';
+  }
+
+  if (
+    lower.includes('helmet') ||
+    lower.includes('two wheeler helmet') ||
+    lower.includes('two-wheeler helmet') ||
+    lower.includes('headgear')
+  ) {
+    return 'helmet';
+  }
+
+  if (
+    lower.includes('led lamp') ||
+    lower.includes('led bulb') ||
+    lower.includes('led')
+  ) {
+    return 'led-lamp';
+  }
+
+  if (
+    lower.includes('packaged drinking water') ||
+    lower.includes('packaged water') ||
+    lower.includes('mineral water')
+  ) {
+    return 'packaged-water';
+  }
+
+  if (
+    lower.includes('toy') ||
+    lower.includes('toys') ||
+    lower.includes('doll') ||
+    lower.includes('board game')
+  ) {
+    return 'toy';
+  }
+
+  if (
+    lower.includes('gold jewellery') ||
+    lower.includes('gold jewelry') ||
+    lower.includes('jewellery') ||
+    lower.includes('jewelry') ||
+    lower.includes('hallmark')
+  ) {
+    return 'gold-jewellery';
+  }
+
+  if (
+    lower.includes('plug') ||
+    lower.includes('socket') ||
+    lower.includes('socket outlet') ||
+    lower.includes('socket-outlet') ||
+    lower.includes('pin plug')
+  ) {
+    return 'plug-socket';
+  }
+
+  if (
+    lower.includes('cement') ||
+    lower.includes('concrete') ||
+    lower.includes('opc')
+  ) {
+    return 'cement';
+  }
+
+  if (
+    lower.includes('electric cable') ||
+    lower.includes('electrical cable') ||
+    lower.includes('wire') ||
+    lower.includes('pvc cable')
+  ) {
+    return 'cable';
+  }
+
+  return null;
+}
+
+/* ============================================================
+   PRODUCT-SPECIFIC SCORE BOOST
+   ============================================================ */
+
+function getProductSpecificBoost(
+  std: BISStandard,
+  productIntent: ProductIntent
+): number {
+  if (!productIntent) {
+    return 0;
+  }
+
+  const text = standardSearchText(std);
+
+  switch (productIntent) {
+    case 'electric-kettle':
+      if (std.standardNumber === 'IS 367:1993') {
+        return 120;
+      }
+
+      if (
+        text.includes('electric kettle') ||
+        text.includes('electric kettles') ||
+        text.includes('electric jug')
+      ) {
+        return 70;
+      }
+
+      // General electrical-appliance safety can be related,
+      // but should not outrank the product-specific standard.
+      if (
+        text.includes('household and similar electrical appliances') ||
+        text.includes('electrical appliances')
+      ) {
+        return 10;
+      }
+
+      return 0;
+
+    case 'water-bottle':
+      if (
+        text.includes('vacuum flask') ||
+        text.includes('water bottle') ||
+        text.includes('thermos')
+      ) {
+        return 80;
+      }
+      return 0;
+
+    case 'pressure-cooker':
+      if (text.includes('pressure cooker')) {
+        return 80;
+      }
+      return 0;
+
+    case 'helmet':
+      if (text.includes('helmet') || text.includes('headgear')) {
+        return 80;
+      }
+      return 0;
+
+    case 'led-lamp':
+      if (text.includes('led lamp') || text.includes('led')) {
+        return 80;
+      }
+      return 0;
+
+    case 'packaged-water':
+      if (
+        text.includes('packaged drinking water') ||
+        text.includes('packaged water')
+      ) {
+        return 80;
+      }
+      return 0;
+
+    case 'toy':
+      if (text.includes('toy') || text.includes('toys')) {
+        return 80;
+      }
+      return 0;
+
+    case 'gold-jewellery':
+      if (
+        text.includes('gold jewellery') ||
+        text.includes('gold jewelry') ||
+        text.includes('jewellery') ||
+        text.includes('jewelry')
+      ) {
+        return 80;
+      }
+      return 0;
+
+    case 'plug-socket':
+      if (
+        text.includes('plug') ||
+        text.includes('socket') ||
+        text.includes('socket-outlet')
+      ) {
+        return 80;
+      }
+      return 0;
+
+    case 'cement':
+      if (text.includes('cement')) {
+        return 80;
+      }
+      return 0;
+
+    case 'cable':
+      if (
+        text.includes('cable') ||
+        text.includes('wire') ||
+        text.includes('pvc')
+      ) {
+        return 80;
+      }
+      return 0;
+
+    default:
+      return 0;
+  }
+}
+
+/* ============================================================
+   UNRELATED PRODUCT PENALTY
+   ============================================================ */
+
+function getUnrelatedPenalty(
+  std: BISStandard,
+  productIntent: ProductIntent
+): number {
+  if (!productIntent) {
+    return 0;
+  }
+
+  const text = standardSearchText(std);
+
+  switch (productIntent) {
+    case 'electric-kettle': {
+      const unrelatedTerms = [
+        'vacuum flask',
+        'water bottle',
+        'thermos',
+        'led lamp',
+        'helmet',
+        'packaged drinking water',
+        'cement',
+        'gold jewellery',
+        'gold jewelry',
+        'toy',
+        'toys',
+        'plug',
+        'socket',
+        'pressure cooker'
+      ];
+
+      return unrelatedTerms.some(term => text.includes(term))
+        ? -100
+        : 0;
+    }
+
+    case 'water-bottle':
+      return text.includes('electric kettle') ||
+        text.includes('helmet') ||
+        text.includes('cement')
+        ? -80
+        : 0;
+
+    case 'pressure-cooker':
+      return text.includes('electric kettle') ||
+        text.includes('helmet') ||
+        text.includes('cement')
+        ? -80
+        : 0;
+
+    case 'helmet':
+      return text.includes('electric kettle') ||
+        text.includes('water bottle') ||
+        text.includes('cement')
+        ? -80
+        : 0;
+
+    case 'led-lamp':
+      return text.includes('electric kettle') ||
+        text.includes('helmet') ||
+        text.includes('pressure cooker')
+        ? -80
+        : 0;
+
+    case 'packaged-water':
+      return text.includes('electric kettle') ||
+        text.includes('helmet') ||
+        text.includes('cement')
+        ? -80
+        : 0;
+
+    case 'toy':
+      return text.includes('electric kettle') ||
+        text.includes('cement') ||
+        text.includes('helmet')
+        ? -80
+        : 0;
+
+    case 'gold-jewellery':
+      return text.includes('electric kettle') ||
+        text.includes('cement') ||
+        text.includes('helmet')
+        ? -80
+        : 0;
+
+    case 'plug-socket':
+      return text.includes('electric kettle') ||
+        text.includes('helmet') ||
+        text.includes('cement')
+        ? -80
+        : 0;
+
+    case 'cement':
+      return text.includes('electric kettle') ||
+        text.includes('helmet') ||
+        text.includes('water bottle')
+        ? -80
+        : 0;
+
+    case 'cable':
+      return text.includes('electric kettle') ||
+        text.includes('helmet') ||
+        text.includes('gold jewellery')
+        ? -80
+        : 0;
+
+    default:
+      return 0;
+  }
+}
+
+/* ============================================================
+   HYBRID BIS SEARCH
+   ============================================================ */
+
 /**
- * Hybrid Search combining keyword token matching and intent/semantic category mapping
+ * Hybrid Search combining:
+ * - Exact standard number matching
+ * - Title matching
+ * - Product coverage
+ * - Keywords
+ * - Token overlap
+ * - Product intent
+ * - Unrelated-product penalties
  */
 export function searchBISKnowledge(query: string): SearchMatch[] {
-  const normalized = query.toLowerCase().trim();
-  const tokens = normalized.split(/[\s,./\-+]+/).filter(t => t.length > 2);
+  const normalized = normalizeText(query);
+
+  const tokens = normalized
+    .split(/[\s,./\-+]+/)
+    .filter(token => token.length > 2);
+
+  const productIntent = detectProductIntent(query);
 
   const matches: SearchMatch[] = [];
 
   for (const std of BIS_STANDARDS) {
     let score = 0;
+
     const matchedKeywords: string[] = [];
     const matchedClauses: string[] = [];
 
-    // Exact standard number match (e.g. "17526", "IS 2347", "4151")
+    const stdText = standardSearchText(std);
+
+    /* --------------------------------------------------------
+       1. Exact standard number
+       -------------------------------------------------------- */
+
     const numOnly = std.standardNumber.replace(/[^\d]/g, '');
-    if (normalized.includes(std.standardNumber.toLowerCase()) || (numOnly && normalized.includes(numOnly))) {
-      score += 50;
+
+    if (
+      normalized.includes(normalizeText(std.standardNumber)) ||
+      (numOnly && normalized.includes(numOnly))
+    ) {
+      score += 100;
       matchedKeywords.push(std.standardNumber);
     }
 
-    // Title match
-    if (normalized.includes(std.title.toLowerCase())) {
-      score += 30;
+    /* --------------------------------------------------------
+       2. Exact title
+       -------------------------------------------------------- */
+
+    if (containsPhrase(normalized, std.title)) {
+      score += 60;
       matchedKeywords.push(std.title);
     }
 
-    // Product coverage matching
+    /* --------------------------------------------------------
+       3. Product coverage
+       -------------------------------------------------------- */
+
     for (const prod of std.productsCovered) {
-      if (normalized.includes(prod.toLowerCase())) {
-        score += 25;
+      if (containsPhrase(normalized, prod)) {
+        score += 45;
         matchedKeywords.push(prod);
       }
     }
 
-    // Keyword tokens
+    /* --------------------------------------------------------
+       4. Keyword matching
+       -------------------------------------------------------- */
+
     for (const kw of std.keywords) {
-      if (normalized.includes(kw.toLowerCase())) {
+      if (containsPhrase(normalized, kw)) {
         score += 15;
         matchedKeywords.push(kw);
       }
     }
 
-    // Individual token overlap
+    /* --------------------------------------------------------
+       5. Individual token overlap
+       -------------------------------------------------------- */
+
     for (const token of tokens) {
-      if (std.title.toLowerCase().includes(token)) score += 3;
-      if (std.scopeSummary.toLowerCase().includes(token)) score += 2;
-      if (std.category.toLowerCase().includes(token)) score += 4;
-      
+      if (normalizeText(std.title).includes(token)) {
+        score += 3;
+      }
+
+      if (normalizeText(std.scopeSummary).includes(token)) {
+        score += 2;
+      }
+
+      if (normalizeText(std.category).includes(token)) {
+        score += 4;
+      }
+
       for (const clause of std.clauses) {
-        if (clause.clauseTitle.toLowerCase().includes(token) || clause.requirement.toLowerCase().includes(token)) {
+        if (
+          normalizeText(clause.clauseTitle).includes(token) ||
+          normalizeText(clause.requirement).includes(token)
+        ) {
           score += 2;
+
           if (!matchedClauses.includes(clause.clauseNumber)) {
-            matchedClauses.push(`${clause.clauseNumber}: ${clause.clauseTitle}`);
+            matchedClauses.push(
+              `${clause.clauseNumber}: ${clause.clauseTitle}`
+            );
           }
         }
       }
     }
 
+    /* --------------------------------------------------------
+       6. Product-specific boost
+       -------------------------------------------------------- */
+
+    score += getProductSpecificBoost(std, productIntent);
+
+    /* --------------------------------------------------------
+       7. Unrelated-product penalty
+       -------------------------------------------------------- */
+
+    score += getUnrelatedPenalty(std, productIntent);
+
+    /* --------------------------------------------------------
+       8. Superseded standards receive lower priority
+       -------------------------------------------------------- */
+
+    if (std.status === 'Superseded') {
+      score -= 20;
+    }
+
+    /* --------------------------------------------------------
+       Add result
+       -------------------------------------------------------- */
+
     if (score > 5) {
-      let explanation = `Covers ${std.productsCovered[0] || std.title}.`;
+      let explanation = `Covers ${
+        std.productsCovered[0] || std.title
+      }.`;
+
       if (matchedKeywords.length > 0) {
-        explanation += ` Matches query keywords: ${matchedKeywords.slice(0, 3).join(', ')}.`;
+        explanation += ` Matches query keywords: ${Array.from(
+          new Set(matchedKeywords)
+        )
+          .slice(0, 4)
+          .join(', ')}.`;
       }
+
+      if (productIntent) {
+        if (
+          productIntent === 'electric-kettle' &&
+          std.standardNumber === 'IS 367:1993'
+        ) {
+          explanation +=
+            ' Strong product-specific match for electric kettles.';
+        } else if (getProductSpecificBoost(std, productIntent) > 0) {
+          explanation += ' Product-specific relevance boost applied.';
+        }
+      }
+
       matches.push({
         standard: std,
         score,
@@ -90,373 +589,997 @@ export function searchBISKnowledge(query: string): SearchMatch[] {
     }
   }
 
-  // Rank by score descending
-  return matches.sort((a, b) => b.score - a.score);
+  /* ----------------------------------------------------------
+     Final ranking
+     ---------------------------------------------------------- */
+
+  return matches.sort((a, b) => {
+    if (b.score !== a.score) {
+      return b.score - a.score;
+    }
+
+    // Prefer non-superseded standards when scores are equal.
+    if (
+      a.standard.status === 'Superseded' &&
+      b.standard.status !== 'Superseded'
+    ) {
+      return 1;
+    }
+
+    if (
+      a.standard.status !== 'Superseded' &&
+      b.standard.status === 'Superseded'
+    ) {
+      return -1;
+    }
+
+    return a.standard.standardNumber.localeCompare(
+      b.standard.standardNumber
+    );
+  });
 }
 
+/* ============================================================
+   PRODUCT UNDERSTANDING
+   ============================================================ */
+
 /**
- * Identify product and user intent from natural language query
+ * Identify product and user intent from natural language.
  */
-export function extractProductUnderstanding(query: string): ProductUnderstanding {
-  const lower = query.toLowerCase();
+export function extractProductUnderstanding(
+  query: string
+): ProductUnderstanding {
+  const lower = normalizeText(query);
 
   let identifiedProduct = 'General product query';
+
   let intent: ProductUnderstanding['intent'] = 'Find Standard';
 
-  if (lower.includes('certif') || lower.includes('license') || lower.includes('isi mark') || lower.includes('scheme') || lower.includes('apply')) {
+  /* ----------------------------------------------------------
+     User intent
+     ---------------------------------------------------------- */
+
+  if (
+    lower.includes('certif') ||
+    lower.includes('license') ||
+    lower.includes('isi mark') ||
+    lower.includes('scheme') ||
+    lower.includes('apply')
+  ) {
     intent = 'Certification Process';
-  } else if (lower.includes('test') || lower.includes('lab') || lower.includes('sample') || lower.includes('pressure test') || lower.includes('drop test')) {
+  } else if (
+    lower.includes('test') ||
+    lower.includes('lab') ||
+    lower.includes('sample') ||
+    lower.includes('pressure test') ||
+    lower.includes('drop test')
+  ) {
     intent = 'Testing Requirement';
-  } else if (lower.includes('hallmark') || lower.includes('gold') || lower.includes('silver') || lower.includes('huid') || lower.includes('jewel')) {
+  } else if (
+    lower.includes('hallmark') ||
+    lower.includes('gold') ||
+    lower.includes('silver') ||
+    lower.includes('huid') ||
+    lower.includes('jewel')
+  ) {
     intent = 'Hallmarking';
-  } else if (lower.includes('consumer') || lower.includes('fake') || lower.includes('verify isi') || lower.includes('complaint') || lower.includes('bis care')) {
+  } else if (
+    lower.includes('consumer') ||
+    lower.includes('fake') ||
+    lower.includes('verify isi') ||
+    lower.includes('complaint') ||
+    lower.includes('bis care')
+  ) {
     intent = 'Consumer Query';
   }
 
-  // Detect product
-  if (lower.includes('water bottle') || lower.includes('bottle') || lower.includes('flask') || lower.includes('thermos')) {
-    identifiedProduct = 'Stainless Steel Water Bottle / Vacuum Flask';
-  } else if (lower.includes('pressure cooker') || lower.includes('cooker')) {
+  /* ----------------------------------------------------------
+     Product detection
+     ---------------------------------------------------------- */
+
+  // IMPORTANT:
+  // Electric kettle comes before generic appliance detection.
+  if (
+    lower.includes('electric kettle') ||
+    lower.includes('electric water kettle') ||
+    lower.includes('kettle jug') ||
+    lower.includes('electric jug')
+  ) {
+    identifiedProduct = 'Electric Kettle';
+  } else if (
+    lower.includes('water bottle') ||
+    lower.includes('bottle') ||
+    lower.includes('flask') ||
+    lower.includes('thermos')
+  ) {
+    identifiedProduct =
+      'Stainless Steel Water Bottle / Vacuum Flask';
+  } else if (
+    lower.includes('pressure cooker') ||
+    lower.includes('cooker')
+  ) {
     identifiedProduct = 'Domestic Pressure Cooker';
-  } else if (lower.includes('helmet') || lower.includes('two wheeler') || lower.includes('headgear')) {
-    identifiedProduct = 'Protective Helmet for Two-Wheeler Riders';
-  } else if (lower.includes('led') || lower.includes('bulb') || lower.includes('lamp') || lower.includes('lighting')) {
+  } else if (
+    lower.includes('helmet') ||
+    lower.includes('two wheeler') ||
+    lower.includes('headgear')
+  ) {
+    identifiedProduct =
+      'Protective Helmet for Two-Wheeler Riders';
+  } else if (
+    lower.includes('led') ||
+    lower.includes('bulb') ||
+    lower.includes('lamp') ||
+    lower.includes('lighting')
+  ) {
     identifiedProduct = 'Self-Ballasted LED Lamp';
-  } else if (lower.includes('water') && (lower.includes('drinking') || lower.includes('packaged') || lower.includes('mineral') || lower.includes('ro'))) {
+  } else if (
+    lower.includes('water') &&
+    (
+      lower.includes('drinking') ||
+      lower.includes('packaged') ||
+      lower.includes('mineral') ||
+      lower.includes('ro')
+    )
+  ) {
     identifiedProduct = 'Packaged Drinking Water';
-  } else if (lower.includes('toy') || lower.includes('toys') || lower.includes('board game') || lower.includes('doll')) {
+  } else if (
+    lower.includes('toy') ||
+    lower.includes('toys') ||
+    lower.includes('board game') ||
+    lower.includes('doll')
+  ) {
     identifiedProduct = 'Children Toys & Playthings';
-  } else if (lower.includes('gold') || lower.includes('hallmark') || lower.includes('jewellery') || lower.includes('necklace')) {
+  } else if (
+    lower.includes('gold') ||
+    lower.includes('hallmark') ||
+    lower.includes('jewellery') ||
+    lower.includes('jewelry') ||
+    lower.includes('necklace')
+  ) {
     identifiedProduct = 'Gold Jewellery & Artefacts';
-  } else if (lower.includes('plug') || lower.includes('socket') || lower.includes('switchboard') || lower.includes('pin plug')) {
-    identifiedProduct = 'Plugs and Socket-Outlets (up to 250V)';
-  } else if (lower.includes('cement') || lower.includes('concrete') || lower.includes('opc')) {
-    identifiedProduct = 'Ordinary Portland Cement (53 Grade)';
-  } else if (lower.includes('cable') || lower.includes('wire') || lower.includes('pvc')) {
+  } else if (
+    lower.includes('plug') ||
+    lower.includes('socket') ||
+    lower.includes('switchboard') ||
+    lower.includes('pin plug')
+  ) {
+    identifiedProduct =
+      'Plugs and Socket-Outlets (up to 250V)';
+  } else if (
+    lower.includes('cement') ||
+    lower.includes('concrete') ||
+    lower.includes('opc')
+  ) {
+    identifiedProduct =
+      'Ordinary Portland Cement (53 Grade)';
+  } else if (
+    lower.includes('cable') ||
+    lower.includes('wire') ||
+    lower.includes('pvc')
+  ) {
     identifiedProduct = 'PVC Insulated Electric Cable';
-  } else if (lower.includes('electrical product') || lower.includes('appliance')) {
-    identifiedProduct = 'Household Electrical Appliance (Specification Unspecified)';
+  } else if (
+    lower.includes('electrical product') ||
+    lower.includes('appliance')
+  ) {
+    identifiedProduct =
+      'Household Electrical Appliance (Specification Unspecified)';
   } else {
-    // Extract noun phrase if possible
-    const clean = query.replace(/(which|what|is|are|the|standard|for|how|to|certify|i|make|manufacture|sell)/gi, '').trim();
+    /* --------------------------------------------------------
+       Fallback noun phrase
+       -------------------------------------------------------- */
+
+    const clean = query
+      .replace(
+        /(which|what|is|are|the|standard|for|how|to|certify|i|make|manufacture|sell)/gi,
+        ''
+      )
+      .trim();
+
     if (clean.length > 2) {
-      identifiedProduct = clean.slice(0, 40);
+      identifiedProduct = clean.slice(0, 60);
     }
   }
 
   return {
     identifiedProduct,
     intent,
-    identifiedMaterial: lower.includes('stainless steel') ? 'Stainless Steel' : lower.includes('aluminium') ? 'Aluminium' : lower.includes('plastic') ? 'Plastic / Polymer' : undefined
+
+    identifiedMaterial: lower.includes('stainless steel')
+      ? 'Stainless Steel'
+      : lower.includes('aluminium')
+      ? 'Aluminium'
+      : lower.includes('plastic')
+      ? 'Plastic / Polymer'
+      : undefined
   };
 }
 
-/**
- * Check if the query is too ambiguous or incomplete, requiring follow-up questions
- */
-export function checkFollowUpNeeded(query: string, matches: SearchMatch[]): string[] | null {
-  const lower = query.toLowerCase().trim();
+/* ============================================================
+   FOLLOW-UP DETECTION
+   ============================================================ */
 
-  // Very broad queries
-  if (lower === 'electrical' || lower === 'electrical product' || lower === 'electrical products' || lower.includes('make electrical') || lower.includes('which electrical')) {
+/**
+ * Check if query is too broad or incomplete.
+ */
+export function checkFollowUpNeeded(
+  query: string,
+  matches: SearchMatch[]
+): string[] | null {
+  const lower = normalizeText(query);
+
+  const productIntent = detectProductIntent(query);
+
+  /* ----------------------------------------------------------
+     Electric kettle is specific enough.
+     Do not ask generic electrical questions.
+     ---------------------------------------------------------- */
+
+  if (productIntent === 'electric-kettle') {
+    return null;
+  }
+
+  /* ----------------------------------------------------------
+     Very broad electrical queries
+     ---------------------------------------------------------- */
+
+  if (
+    lower === 'electrical' ||
+    lower === 'electrical product' ||
+    lower === 'electrical products' ||
+    lower.includes('make electrical') ||
+    lower.includes('which electrical')
+  ) {
     return [
-      'What specific type of electrical product do you manufacture? (e.g., Plugs & sockets, LED bulbs, electric iron, cables, or circuit breakers)',
+      'What specific type of electrical product do you manufacture? (e.g., Plugs & sockets, LED bulbs, electric kettle, electric iron, cables, or circuit breakers)',
       'What is its rated voltage and power capacity (e.g., 230V single phase or 415V three phase)?',
       'Is it intended for domestic household use or industrial installation?'
     ];
   }
 
-  if (lower.includes('metal') && !lower.includes('bottle') && !lower.includes('cooker') && !lower.includes('gold')) {
+  /* ----------------------------------------------------------
+     Broad metal queries
+     ---------------------------------------------------------- */
+
+  if (
+    lower.includes('metal') &&
+    !lower.includes('bottle') &&
+    !lower.includes('cooker') &&
+    !lower.includes('gold')
+  ) {
     return [
       'What kind of metal item are you fabricating? (e.g., Stainless steel utensils, structural steel bars, or aluminium cookware)',
       'Is the item intended to come into contact with drinking water, food products, or structural loads?'
     ];
   }
 
-  if (lower.includes('food') && !lower.includes('water')) {
+  /* ----------------------------------------------------------
+     Broad food queries
+     ---------------------------------------------------------- */
+
+  if (
+    lower.includes('food') &&
+    !lower.includes('water')
+  ) {
     return [
       'What specific food or beverage product are you packaging? (e.g., Packaged drinking water, edible oils, milk powder)',
       'Are you seeking BIS certification (ISI Mark) or FSSAI regulatory compliance, or both?'
     ];
   }
 
+  /* ----------------------------------------------------------
+     No useful matches
+     ---------------------------------------------------------- */
+
+  if (matches.length === 0) {
+    return [
+      'What is the exact product name or product category?',
+      'What material is the product made from?',
+      'What is the intended use or application?'
+    ];
+  }
+
   return null;
 }
 
+/* ============================================================
+   POTENTIALLY APPLICABLE STANDARDS
+   ============================================================ */
+
+function buildPotentialStandards(
+  matches: SearchMatch[],
+  productIntent: ProductIntent
+): StructuredAIResponse['potentiallyApplicableStandards'] {
+  let filtered = matches.filter(match => match.score >= 15);
+
+  /*
+   * For product-specific searches, keep standards that are
+   * reasonably relevant. This prevents obviously unrelated
+   * standards from filling the top results.
+   */
+  if (productIntent) {
+    const productRelevant = filtered.filter(match => {
+      const boost = getProductSpecificBoost(
+        match.standard,
+        productIntent
+      );
+
+      const penalty = getUnrelatedPenalty(
+        match.standard,
+        productIntent
+      );
+
+      return boost > 0 || penalty === 0;
+    });
+
+    if (productRelevant.length > 0) {
+      filtered = productRelevant;
+    }
+  }
+
+  return filtered.slice(0, 3).map(match => ({
+    standardNumber: match.standard.standardNumber,
+    title: match.standard.title,
+    whyItMayApply: match.relevanceExplanation,
+    relevantScope: match.standard.scopeSummary,
+    status: match.standard.status,
+    supersededWarning: match.standard.supersededWarning,
+    sourceDoc: match.standard.sourceDocument,
+    clauseRef: match.standard.clauses[0]?.clauseNumber,
+    edition: match.standard.edition,
+    pageRef: match.standard.clauses[0]?.page
+  }));
+}
+
+/* ============================================================
+   MAIN RESPONSE GENERATOR
+   ============================================================ */
+
 /**
- * Generate Structured AI Response following the exact "Source or Refuse" principle
+ * Generate Structured AI Response following the
+ * "Source or Refuse" principle.
  */
-export function generateSourceGroundedResponse(query: string, isDemoMode = false): StructuredAIResponse {
+export function generateSourceGroundedResponse(
+  query: string,
+  isDemoMode = false
+): StructuredAIResponse {
   const matches = searchBISKnowledge(query);
-  const understanding = extractProductUnderstanding(query);
-  const followUps = checkFollowUpNeeded(query, matches);
-  const currentDate = new Date().toISOString().split('T')[0];
 
-  // Complex multi-part query detection
-  const lower = query.toLowerCase();
-  const hasMultipleTasks = (
-    (lower.includes('which standard') || lower.includes('what standard') || lower.includes('standard for')) &&
-    (lower.includes('mandatory') || lower.includes('qco') || lower.includes('compulsory') || lower.includes('test') || lower.includes('lab') || lower.includes('how to certify'))
-  ) || (lower.includes('and') && (lower.includes('test') || lower.includes('lab')) && lower.includes('certif'));
+  const understanding =
+    extractProductUnderstanding(query);
 
-  // CASE 1: Incomplete or overly broad query requiring clarification
-  if (followUps && (matches.length === 0 || matches[0].score < 15)) {
+  const followUps =
+    checkFollowUpNeeded(query, matches);
+
+  const currentDate =
+    new Date().toISOString().split('T')[0];
+
+  const productIntent =
+    detectProductIntent(query);
+
+  /* ----------------------------------------------------------
+     Complex multi-part query detection
+     ---------------------------------------------------------- */
+
+  const lower = normalizeText(query);
+
+  const hasMultipleTasks =
+    (
+      (
+        lower.includes('which standard') ||
+        lower.includes('what standard') ||
+        lower.includes('standard for')
+      ) &&
+      (
+        lower.includes('mandatory') ||
+        lower.includes('qco') ||
+        lower.includes('compulsory') ||
+        lower.includes('test') ||
+        lower.includes('lab') ||
+        lower.includes('how to certify')
+      )
+    ) ||
+    (
+      lower.includes('and') &&
+      (
+        lower.includes('test') ||
+        lower.includes('lab')
+      ) &&
+      lower.includes('certif')
+    );
+
+  /* ========================================================
+     CASE 1: NEEDS CLARIFICATION
+     ======================================================== */
+
+  if (
+    followUps &&
+    (
+      matches.length === 0 ||
+      matches[0].score < 15
+    )
+  ) {
     return {
-      understandingText: `You are inquiring about standards or compliance for "${understanding.identifiedProduct}", but the technical specifications (material, intended use, voltage/capacity) require clarification.`,
-      answer: `To identify the exact Indian Standard and certification requirements, more technical details are required. BIS publishes over 21,000 active Indian Standards, and standards are designated based on precise product taxonomy, materials, and safety parameters.`,
+      understandingText:
+        `You are inquiring about standards or compliance for "${understanding.identifiedProduct}", but more product-specific information is required.`,
+
+      answer:
+        `To identify the most relevant Indian Standard, more technical details are required. BIS standards are product-specific and can depend on the product type, material, intended use and technical characteristics.`,
+
       productUnderstanding: understanding,
+
       potentiallyApplicableStandards: [],
+
       sources: [],
+
       reliabilityLevel: 'NEEDS_VERIFICATION',
-      reliabilityReason: 'Query lacks required product specificity (e.g. material grade, operating voltage, or intended application).',
-      evidenceReasoning: 'Retrieved 0 high-confidence matches from BIS knowledge index due to broad/ambiguous search tokens. Prompting user with clarification questions to avoid guessing.',
+
+      reliabilityReason:
+        'Query lacks sufficient product specificity for a confident standard recommendation.',
+
+      evidenceReasoning:
+        'The retrieval engine found insufficient high-confidence matches and therefore requested clarification rather than guessing.',
+
       followUpQuestions: followUps,
-      disclaimer: 'This assistant provides guidance based on retrieved sources and is not a replacement for official BIS decisions. Standard recommendations must be verified against current authoritative BIS information.',
+
+      disclaimer:
+        'This assistant provides guidance based on its indexed sources and is not a replacement for official BIS decisions. Recommendations should be verified against current authoritative BIS information.',
+
       isDemoData: isDemoMode,
+
       importantNotes: [
-        'BIS certification schemes and testing protocols differ fundamentally by product grade and material.',
-        'Never rely on generalized or unverified standard numbers for factory setup or import clearance.'
+        'Different products may have different applicable Indian Standards.',
+        'Certification and regulatory requirements should be verified against current BIS information.'
       ],
+
       nextSteps: [
-        'Select or specify your exact product category from the follow-up options.',
-        'Confirm whether the item is for domestic household or commercial/industrial use.',
-        'Check if your product uses electricity, high pressure, or food contact materials.'
+        'Specify the exact product category.',
+        'Provide the material or composition where relevant.',
+        'Describe the intended use or application.'
       ]
     };
   }
 
-  // CASE 2: No authoritative match found - REFUSE TO GUESS
-  if (matches.length === 0 || matches[0].score < 10) {
+  /* ========================================================
+     CASE 2: NO SUFFICIENT MATCH
+     ======================================================== */
+
+  if (
+    matches.length === 0 ||
+    matches[0].score < 10
+  ) {
     return {
-      understandingText: `You inquired regarding specifications or standards for "${understanding.identifiedProduct}".`,
-      answer: `I could not find sufficient authoritative BIS evidence in the indexed standards database to answer this question confidently.
+      understandingText:
+        `You inquired regarding specifications or standards for "${understanding.identifiedProduct}".`,
 
-Under the "Source or Refuse" architecture, BIS Sahayak AI strictly refrains from inventing Indian Standard numbers, clauses, test requirements, fees, or licensing rules when verified records are unavailable.`,
+      answer:
+        `I could not find sufficient evidence in the indexed BIS knowledge base to answer this question confidently.
+
+Under the "Source or Refuse" architecture, BIS Sahayak AI does not invent Indian Standard numbers, clauses, test requirements, fees, or licensing rules when sufficient source evidence is unavailable.`,
+
       productUnderstanding: understanding,
+
       potentiallyApplicableStandards: [],
+
       sources: [],
+
       reliabilityLevel: 'NOT_VERIFIED',
-      reliabilityReason: 'No direct verified match exists in the current authorized BIS knowledge repository for this specific query.',
-      evidenceReasoning: 'Hybrid search returned zero index hits with confidence score >= 10. System triggered zero-hallucination refusal to prevent fabricating standard numbers.',
+
+      reliabilityReason:
+        'No sufficiently strong match was found in the current indexed BIS knowledge repository.',
+
+      evidenceReasoning:
+        'Hybrid retrieval returned no sufficiently confident result. The system therefore avoids fabricating a standard recommendation.',
+
       followUpQuestions: [
-        'Could you provide the exact chemical or material composition of the product?',
-        'Does the product fall under electrical, mechanical, civil, chemical, or food categories?',
-        'Would you like to search the official BIS Manakonline directory directly at services.bis.gov.in?'
+        'Could you provide the exact product name?',
+        'What is the material or composition of the product?',
+        'What is the intended use of the product?',
+        'Would you like to verify the result directly on the official BIS portal?'
       ],
-      disclaimer: 'This assistant provides guidance based on retrieved sources and is not a replacement for official BIS decisions.',
+
+      disclaimer:
+        'This assistant provides guidance based on retrieved sources and is not a replacement for official BIS decisions.',
+
       isDemoData: isDemoMode,
+
       importantNotes: [
-        'Official Indian Standards can be looked up on the BIS Manakonline portal (services.bis.gov.in) using Harmonized System (HS) codes.',
-        'If your product is newly developed, it may be evaluated under BIS Scheme IV (Certificate of Conformity) or subject to a new technical committee review.'
+        'Official Indian Standards should be verified through the BIS Standards Portal.',
+        'Regulatory and certification requirements can change and should be checked against current official information.'
       ],
+
       nextSteps: [
-        'Search the official BIS Standards Portal: https://services.bis.gov.in/php/BIS_2.0/bisconnect/knowyourstandards/indian_standards/isdetails',
-        'Contact your nearest BIS Branch Office for pre-application scope verification.'
+        'Search the official BIS Standards Portal.',
+        'Verify the exact scope and current status of the standard.',
+        'Contact BIS for product-specific regulatory clarification when required.'
       ]
     };
   }
 
-  // CASE 3: Found verified or closely related match
+  /* ========================================================
+     CASE 3: MATCH FOUND
+     ======================================================== */
+
   const bestMatch = matches[0];
+
   const std = bestMatch.standard;
-  const isSuperseded = std.status === 'Superseded';
 
-  // Check confidence
-  const isHighConfidence = bestMatch.score >= 25 && !isSuperseded;
-  const reliability: ReliabilityLevel = isSuperseded 
-    ? 'NEEDS_VERIFICATION' 
-    : isHighConfidence ? 'VERIFIED' : 'NEEDS_VERIFICATION';
+  const isSuperseded =
+    std.status === 'Superseded';
 
-  // Build answer text
+  /*
+   * High confidence requires:
+   * - strong score
+   * - current standard
+   * - direct product relevance where product intent exists
+   */
+
+  const directProductBoost =
+    productIntent
+      ? getProductSpecificBoost(
+          std,
+          productIntent
+        )
+      : 0;
+
+  const isHighConfidence =
+    bestMatch.score >= 40 &&
+    !isSuperseded &&
+    (
+      !productIntent ||
+      directProductBoost > 0
+    );
+
+  const reliability: ReliabilityLevel =
+    isSuperseded
+      ? 'NEEDS_VERIFICATION'
+      : isHighConfidence
+      ? 'VERIFIED'
+      : 'NEEDS_VERIFICATION';
+
+  /* ========================================================
+     ANSWER TEXT
+     ======================================================== */
+
   let answerText = '';
+
   if (isSuperseded) {
-    answerText = `⚠️ **CRITICAL WARNING:** The standard referenced in your inquiry (**${std.standardNumber}**) is **SUPERSEDED and WITHDRAWN by BIS**. `;
+    answerText =
+      `⚠️ **Important:** The standard identified in the indexed BIS knowledge base (**${std.standardNumber}**) is marked as **SUPERSEDED**.`;
+
     if (std.supersededBy) {
-      answerText += `It has been officially replaced by **${std.supersededBy}**. You MUST NOT apply for or manufacture under the superseded standard, as it is legally void under Indian law.`;
+      answerText +=
+        ` The indexed record indicates replacement by **${std.supersededBy}**. Please verify the current applicable standard on the official BIS portal before using this information.`;
     }
   } else if (isHighConfidence) {
-    answerText = `Based on verified BIS gazette records for "${understanding.identifiedProduct}", the applicable Indian Standard is **${std.standardNumber}** (*${std.title}*).`;
+    answerText =
+      `Based on the indexed BIS knowledge base, the strongest product-specific match for "${understanding.identifiedProduct}" is **${std.standardNumber}** (*${std.title}*).`;
+
     if (std.qcoMandatory) {
-      answerText += ` Compliance with this standard is **LEGALLY MANDATORY** across India under Quality Control Order (**${std.qcoNotificationNumber}**). Manufacturing, storing, importing, or selling without the genuine BIS Standard Mark (ISI mark) is punishable under the BIS Act, 2016.`;
+      answerText +=
+        ` The indexed record indicates that this standard is associated with a mandatory Quality Control Order (${std.qcoNotificationNumber || 'QCO reference not specified'}). Please verify the current QCO and effective date on the official BIS/Government source.`;
     } else {
-      answerText += ` This standard operates under the Voluntary Certification Scheme (Scheme I), unless specific ministerial notifications mandate it.`;
+      answerText +=
+        ` The current indexed record does not indicate a mandatory QCO. Verify the latest regulatory position before making compliance decisions.`;
     }
   } else {
-    answerText = `A closely related Indian Standard identified in the BIS index is **${std.standardNumber}** (*${std.title}*). Please verify whether your specific product variant falls within its defined scope before proceeding.`;
+    answerText =
+      `A potentially relevant Indian Standard identified in the indexed BIS knowledge base is **${std.standardNumber}** (*${std.title}*). Please verify that your exact product variant falls within its defined scope before proceeding.`;
   }
 
-  // Gather matching laboratories
-  const stdPrefix = std.standardNumber.split(':')[0];
-  const matchingLabs = BIS_LABORATORIES.filter(l => 
-    l.recognizedStandards.some(s => s.includes(stdPrefix))
-  );
+  /* ========================================================
+     MATCHING LABORATORIES
+     ======================================================== */
 
-  // Decomposed tasks for multi-part questions
-  let decomposedTasks: StructuredAIResponse['decomposedTasks'] = undefined;
+  const stdPrefix =
+    std.standardNumber.split(':')[0];
+
+  const matchingLabs =
+    BIS_LABORATORIES.filter(lab =>
+      lab.recognizedStandards.some(
+        standard => standard.includes(stdPrefix)
+      )
+    );
+
+  /* ========================================================
+     DECOMPOSED TASKS
+     ======================================================== */
+
+  let decomposedTasks:
+    StructuredAIResponse['decomposedTasks'] =
+    undefined;
+
   if (hasMultipleTasks) {
     decomposedTasks = [
       {
         taskTitle: '1. Applicable Indian Standard',
-        finding: isSuperseded 
-          ? `Superseded: ${std.standardNumber}. Current valid standard: ${std.supersededBy || 'Verify on Manakonline'}`
+
+        finding: isSuperseded
+          ? `Superseded: ${std.standardNumber}. Current valid standard: ${std.supersededBy || 'Verify on the official BIS portal'}`
           : `${std.standardNumber} (${std.title}) [Edition: ${std.edition || 'Latest'}]`,
-        confidence: isSuperseded ? 'NEEDS_VERIFICATION' : 'VERIFIED',
-        sourceRef: std.sourceDocument
+
+        confidence:
+          isSuperseded
+            ? 'NEEDS_VERIFICATION'
+            : isHighConfidence
+            ? 'VERIFIED'
+            : 'NEEDS_VERIFICATION',
+
+        sourceRef:
+          std.sourceDocument
       },
+
       {
         taskTitle: '2. Mandatory / QCO Legal Status',
-        finding: std.qcoMandatory 
-          ? `Mandatory under verified QCO: ${std.qcoNotificationNumber || 'Central Government QCO'} (Effective: ${std.qcoEffectiveDate || 'Enforced'})`
-          : `Voluntary Scheme I (ISI Mark), no mandatory QCO evidence found in current database.`,
-        confidence: 'VERIFIED',
-        sourceRef: std.qcoNotificationNumber ? `Gazette Notification: ${std.qcoNotificationNumber}` : 'BIS Voluntary Schedule'
+
+        finding: std.qcoMandatory
+          ? `The indexed record indicates a mandatory QCO: ${std.qcoNotificationNumber || 'QCO reference not specified'}. Verify current applicability and effective date from the official government/BIS source.`
+          : `No mandatory QCO is indicated in the current indexed record.`,
+
+        confidence:
+          'NEEDS_VERIFICATION',
+
+        sourceRef:
+          std.qcoNotificationNumber
+            ? `Gazette Notification: ${std.qcoNotificationNumber}`
+            : 'Indexed BIS standard record'
       },
+
       {
-        taskTitle: '3. Mandatory Testing Requirements',
-        finding: std.testRequirements.length > 0
-          ? `${std.testRequirements.length} primary tests required: ${std.testRequirements.map(t => t.testName).slice(0, 3).join(', ')}.`
-          : 'Testing schedule defined in factory Scheme of Testing and Inspection (SIT).',
-        confidence: 'VERIFIED',
-        sourceRef: `${std.standardNumber} Section on Methods of Test`
+        taskTitle: '3. Testing Requirements',
+
+        finding:
+          std.testRequirements.length > 0
+            ? `${std.testRequirements.length} indexed test requirements: ${std.testRequirements
+                .map(test => test.testName)
+                .slice(0, 3)
+                .join(', ')}.`
+            : 'Detailed test requirements were not populated in the current indexed record. Refer to the official standard document for complete test methods and requirements.',
+
+        confidence:
+          std.testRequirements.length > 0
+            ? 'VERIFIED'
+            : 'NEEDS_VERIFICATION',
+
+        sourceRef:
+          `${std.standardNumber} — Methods of Test / Requirements`
       },
+
       {
-        taskTitle: '4. Authorized BIS & Recognized Laboratories',
-        finding: matchingLabs.length > 0
-          ? `${matchingLabs.length} verified facilities available: ${matchingLabs.map(l => `${l.name} (${l.city})`).slice(0, 2).join(', ')}.`
-          : 'Testing facility authorization needs verification with the official BIS LRS directory.',
-        confidence: matchingLabs.length > 0 ? 'VERIFIED' : 'NEEDS_VERIFICATION',
-        sourceRef: 'BIS Laboratory Recognition Scheme (LRS) Gazette Register'
+        taskTitle:
+          '4. Authorized BIS & Recognized Laboratories',
+
+        finding:
+          matchingLabs.length > 0
+            ? `${matchingLabs.length} matching indexed laboratory record(s): ${matchingLabs
+                .map(lab => `${lab.name} (${lab.city})`)
+                .slice(0, 2)
+                .join(', ')}.`
+            : 'No matching laboratory was found in the current indexed laboratory data. Verify the official BIS laboratory recognition directory.',
+
+        confidence:
+          matchingLabs.length > 0
+            ? 'NEEDS_VERIFICATION'
+            : 'NEEDS_VERIFICATION',
+
+        sourceRef:
+          'Indexed BIS Laboratory Recognition data'
       },
+
       {
         taskTitle: '5. Certification Route',
-        finding: `${std.certificationScheme} via Manakonline Portal (requires factory SIT setup, Form-I submission, audit & sample testing).`,
-        confidence: 'VERIFIED',
-        sourceRef: 'Bureau of Indian Standards Conformity Assessment Regulations'
+
+        finding:
+          `${std.certificationScheme}. Verify the current certification route, application requirements, fees, audit procedure and applicable regulations through the official BIS portal.`,
+
+        confidence:
+          'NEEDS_VERIFICATION',
+
+        sourceRef:
+          'Indexed BIS certification information'
       }
     ];
   }
 
-  // Key clauses and testing parameters
-  const keyClauses = std.clauses.map(c => 
-    `${c.clauseNumber} - ${c.clauseTitle}: ${c.requirement} (Mandatory: ${c.mandatory ? 'Yes' : 'No'}${c.page ? `, Page ${c.page}` : ''})`
-  );
-  const testingParameters = std.testRequirements.map(t => 
-    `${t.testName} (${t.clauseRef}): ${t.purpose} [Parameters: ${t.parameters}]`
-  );
+  /* ========================================================
+     KEY CLAUSES
+     ======================================================== */
 
-  // Sources cards
-  const sources: StructuredAIResponse['sources'] = [
-    {
-      documentName: std.sourceDocument,
-      standardNumber: std.standardNumber,
-      section: std.category,
-      clause: std.clauses.map(c => c.clauseNumber).join(', '),
-      page: std.clauses[0]?.page || 1,
-      version: std.version,
-      documentType: std.documentType,
-      lastUpdated: std.lastUpdated,
-      retrievalDate: currentDate,
-      officialPortalUrl: std.sourceUrl,
-      isAuthoritative: true,
-      isDemoData: isDemoMode,
-      excerpt: `Standard Scope: "${std.scopeSummary}" | Key Clause (${std.clauses[0]?.clauseNumber}): "${std.clauses[0]?.requirement}"`
-    }
-  ];
+  const keyClauses =
+    std.clauses.map(clause =>
+      `${clause.clauseNumber} - ${clause.clauseTitle}: ${clause.requirement} (Mandatory: ${
+        clause.mandatory ? 'Yes' : 'No'
+      }${
+        clause.page
+          ? `, Page ${clause.page}`
+          : ''
+      })`
+    );
+
+  /* ========================================================
+     TESTING PARAMETERS
+     ======================================================== */
+
+  const testingParameters =
+    std.testRequirements.map(test =>
+      `${test.testName} (${test.clauseRef}): ${test.purpose} [Parameters: ${test.parameters}]`
+    );
+
+  /* ========================================================
+     SOURCES
+     ======================================================== */
+
+  const sources:
+    StructuredAIResponse['sources'] = [
+      {
+        documentName:
+          std.sourceDocument,
+
+        standardNumber:
+          std.standardNumber,
+
+        section:
+          std.category,
+
+        clause:
+          std.clauses
+            .map(clause => clause.clauseNumber)
+            .join(', '),
+
+        page:
+          std.clauses[0]?.page || 1,
+
+        version:
+          std.version,
+
+        documentType:
+          std.documentType,
+
+        lastUpdated:
+          std.lastUpdated,
+
+        retrievalDate:
+          currentDate,
+
+        officialPortalUrl:
+          std.sourceUrl,
+
+        isAuthoritative:
+          true,
+
+        isDemoData:
+          isDemoMode,
+
+        excerpt:
+          `Standard Scope: "${std.scopeSummary}"${
+            std.clauses[0]
+              ? ` | Key Clause (${std.clauses[0].clauseNumber}): "${std.clauses[0].requirement}"`
+              : ''
+          }`
+      }
+    ];
+
+  /* --------------------------------------------------------
+     QCO source
+     -------------------------------------------------------- */
 
   if (std.qcoNotificationNumber) {
     sources.push({
-      documentName: `Quality Control Order: ${std.qcoNotificationNumber}`,
-      standardNumber: std.standardNumber,
-      section: 'Department for Promotion of Industry and Internal Trade (DPIIT) / Ministry Gazette',
-      clause: 'Schedule I / Mandatory Enforcement Clause',
-      version: `Gazette Effective Date: ${std.qcoEffectiveDate}`,
-      documentType: 'Gazette Quality Control Order',
-      lastUpdated: std.qcoEffectiveDate,
-      retrievalDate: currentDate,
-      officialPortalUrl: 'https://www.services.bis.gov.in/php/BIS_2.0/bisconnect/knowyourstandards/qco_orders',
-      isAuthoritative: true,
-      isDemoData: isDemoMode,
-      excerpt: `Order mandates that goods or articles specified in the Table shall conform to the corresponding Indian Standard and bear the Standard Mark under a licence from the Bureau.`
+      documentName:
+        `Quality Control Order: ${std.qcoNotificationNumber}`,
+
+      standardNumber:
+        std.standardNumber,
+
+      section:
+        'Quality Control Order',
+
+      clause:
+        'Applicable QCO provision',
+
+      version:
+        `Gazette Effective Date: ${std.qcoEffectiveDate || 'Verify current date'}`,
+
+      documentType:
+        'Gazette Quality Control Order',
+
+      lastUpdated:
+        std.qcoEffectiveDate || std.lastUpdated,
+
+      retrievalDate:
+        currentDate,
+
+      officialPortalUrl:
+        'https://www.services.bis.gov.in/php/BIS_2.0/bisconnect/knowyourstandards/qco_orders',
+
+      isAuthoritative:
+        true,
+
+      isDemoData:
+        isDemoMode,
+
+      excerpt:
+        `Indexed QCO reference associated with ${std.standardNumber}. Verify current applicability and effective date from the official government/BIS source.`
     });
   }
 
+  /* ========================================================
+     POTENTIALLY APPLICABLE STANDARDS
+     ======================================================== */
+
+  const potentiallyApplicableStandards =
+    buildPotentialStandards(
+      matches,
+      productIntent
+    );
+
+  /* ========================================================
+     IMPORTANT NOTES
+     ======================================================== */
+
+  const importantNotes = [
+    std.qcoMandatory
+      ? `The indexed record indicates a Quality Control Order (${std.qcoNotificationNumber || 'reference not specified'}). Verify its current applicability and effective date from the official BIS/Government source.`
+      : `The current indexed record does not indicate a mandatory QCO. A tender, contract, regulator or later notification may impose additional requirements.`,
+
+    isSuperseded
+      ? `Do not rely on ${std.standardNumber} until its replacement/current status is verified from the official BIS portal.`
+      : `Verify the complete scope, amendments and current status of ${std.standardNumber} using the official BIS standard record.`,
+
+    `The indexed knowledge base may not contain every clause, amendment, test method or laboratory update.`
+  ];
+
+  /* ========================================================
+     NEXT STEPS
+     ======================================================== */
+
+  const nextSteps = [
+    `1. Verify the official BIS record for ${std.standardNumber}.`,
+
+    `2. Confirm that your exact product, material and intended use fall within the standard's scope.`,
+
+    `3. Review the complete official standard, including amendments and test requirements.`,
+
+    `4. Verify the current certification/QCO position before manufacturing, selling, importing or applying for certification.`
+  ];
+
+  /* ========================================================
+     CERTIFICATION GUIDANCE
+     ======================================================== */
+
+  const certificationSteps = [
+    `1. Standard Verification: Confirm the current official BIS record for ${std.standardNumber}.`,
+
+    `2. Product Scope: Confirm that your exact product variant falls within the standard scope.`,
+
+    `3. Testing Setup: Review the official standard for applicable testing equipment and methods.`,
+
+    `4. Application: Follow the current BIS certification/application procedure applicable to your product.`,
+
+    `5. Inspection & Testing: Complete any applicable BIS inspection and sample testing requirements.`,
+
+    `6. Licence / Certification: Use the applicable BIS certification route only after verifying current requirements.`
+  ];
+
+  /* ========================================================
+     TESTING GUIDANCE
+     ======================================================== */
+
+  const requiredTests =
+    std.testRequirements.map(test =>
+      `${test.testName} (${test.clauseRef}): ${test.purpose}`
+    );
+
+  const samplePreparation =
+    std.testRequirements.length > 0
+      ? 'Prepare samples according to the sampling and test requirements specified in the official standard.'
+      : 'Detailed sample preparation requirements are not populated in the current indexed record. Refer to the official standard document.';
+
+  /* ========================================================
+     FINAL STRUCTURED RESPONSE
+     ======================================================== */
+
   return {
-    understandingText: `You are requesting compliance and specification guidance for "${understanding.identifiedProduct}".`,
-    answer: answerText,
+    understandingText:
+      `You are requesting standards and compliance guidance for "${understanding.identifiedProduct}".`,
+
+    answer:
+      answerText,
+
     applicableStandardDetails: {
-      standardNumber: std.standardNumber,
-      title: std.title,
-      status: std.status,
-      supersededWarning: std.supersededWarning,
-      amendment: std.amendmentNumber,
-      edition: std.edition
+      standardNumber:
+        std.standardNumber,
+
+      title:
+        std.title,
+
+      status:
+        std.status,
+
+      supersededWarning:
+        std.supersededWarning,
+
+      amendment:
+        std.amendmentNumber,
+
+      edition:
+        std.edition
     },
+
     requirementsSummary: {
       keyClauses,
+
       testingParameters
     },
-    importantNotes: [
-      std.qcoMandatory 
-        ? `Quality Control Order (${std.qcoNotificationNumber}): Selling or distributing without the ISI mark carries statutory penalties under Section 29 of the BIS Act, 2016.`
-        : `This product is under voluntary certification unless required by a specific tender or state regulator.`,
-      isSuperseded 
-        ? `Do NOT reference ${std.standardNumber} on packaging or purchase orders. Switch all testing to ${std.supersededBy}.`
-        : `The manufacturer must maintain an internal Scheme of Testing and Inspection (SIT) and calibrated testing apparatus on factory premises.`,
-      `Always obtain the official watermarked standard document from the BIS portal (services.bis.gov.in) to inspect complete dimension tables and amendments.`
-    ],
-    nextSteps: [
-      `1. Obtain official standard copy of ${std.standardNumber} from BIS Manakonline (services.bis.gov.in).`,
-      `2. Verify that factory equipment conforms to test parameters for: ${std.testRequirements[0]?.testName || 'Performance Testing'}.`,
-      `3. Apply online for Scheme I certification at manakonline.in with Form-I, test certificates, and factory machinery layout.`,
-      `4. Schedule factory inspection and submit independent sample for lab verification at an authorized BIS facility.`
-    ],
-    productUnderstanding: understanding,
-    potentiallyApplicableStandards: matches.slice(0, 3).map(m => ({
-      standardNumber: m.standard.standardNumber,
-      title: m.standard.title,
-      whyItMayApply: m.relevanceExplanation,
-      relevantScope: m.standard.scopeSummary,
-      status: m.standard.status,
-      supersededWarning: m.standard.supersededWarning,
-      sourceDoc: m.standard.sourceDocument,
-      clauseRef: m.standard.clauses[0]?.clauseNumber,
-      edition: m.standard.edition,
-      pageRef: m.standard.clauses[0]?.page
-    })),
+
+    importantNotes,
+
+    nextSteps,
+
+    productUnderstanding:
+      understanding,
+
+    potentiallyApplicableStandards,
+
     certificationGuidance: {
-      schemeName: std.certificationScheme,
-      isMandatoryByQCO: std.qcoMandatory,
-      qcoReference: std.qcoNotificationNumber,
-      legalMandateText: std.qcoMandatory 
-        ? `Mandatory under verified QCO: ${std.qcoNotificationNumber}`
-        : 'Voluntary Scheme I (ISI Mark)',
-      keySteps: [
-        `1. Standard Verification: Obtain official copy of ${std.standardNumber} from BIS portal (manakonline.in).`,
-        `2. In-house Testing Setup: Equip factory with mandatory testing apparatus specified in ${std.standardNumber}.`,
-        `3. Application Submission: Submit Form-I on the Manakonline portal with technical drawings and raw material test certificates.`,
-        `4. Factory Audit: BIS Technical Officer conducts on-site audit to inspect production quality controls.`,
-        `5. Sample Verification: Independent sample tested at ${matchingLabs[0]?.name || 'BIS Central Laboratory'}.`,
-        `6. Grant of Licence (CML Number): Receive licence to use the standard ISI Mark.`
-      ]
+      schemeName:
+        std.certificationScheme,
+
+      isMandatoryByQCO:
+        std.qcoMandatory,
+
+      qcoReference:
+        std.qcoNotificationNumber,
+
+      legalMandateText:
+        std.qcoMandatory
+          ? `The indexed record indicates a mandatory QCO reference: ${std.qcoNotificationNumber || 'not specified'}. Verify the current legal position from the official source.`
+          : 'No mandatory QCO is indicated in the current indexed record.',
+
+      keySteps:
+        certificationSteps
     },
+
     testingGuidance: {
-      requiredTests: std.testRequirements.map(t => `${t.testName} (${t.clauseRef}): ${t.purpose}`),
-      samplePreparation: 'Test specimens must be drawn randomly from regular production lots in designated lot sizes according to the sampling plan in the standard.',
-      relevantLabs: matchingLabs.map(l => `${l.name} (${l.city}, ${l.state}) - Status: ${l.recognitionStatus}`)
+      requiredTests,
+
+      samplePreparation,
+
+      relevantLabs:
+        matchingLabs.map(lab =>
+          `${lab.name} (${lab.city}, ${lab.state}) - Status: ${lab.recognitionStatus}`
+        )
     },
+
     sources,
-    reliabilityLevel: reliability,
-    reliabilityReason: isSuperseded
-      ? `Standard is officially superseded. Verification flagged with regulatory replacement warning.`
-      : isHighConfidence
-        ? `Exact standard match (${std.standardNumber}) retrieved from authorized BIS catalog with verifiable clause citations.`
-        : `Related standard found based on semantic similarity. Official confirmation recommended for specific sub-variants.`,
-    evidenceReasoning: isSuperseded
-      ? `Retrieved historical record for ${std.standardNumber}. Superseded flag detected, auto-linking to active standard ${std.supersededBy} per BIS Gazette archives.`
-      : `Matched user query tokens to indexed BIS catalog node (${std.id}). Verified active status in BIS Gazette, confirmed QCO decree ${std.qcoNotificationNumber || 'Voluntary'}, and retrieved clause citations from ${std.sourceDocument}.`,
+
+    reliabilityLevel:
+      reliability,
+
+    reliabilityReason:
+      isSuperseded
+        ? `The indexed record marks ${std.standardNumber} as superseded and therefore requires current-status verification.`
+        : isHighConfidence
+        ? `Strong product-specific match for ${understanding.identifiedProduct}: ${std.standardNumber}.`
+        : `A related standard was retrieved, but additional official verification is recommended for the exact product variant.`,
+
+    evidenceReasoning:
+      isSuperseded
+        ? `Retrieved indexed record ${std.standardNumber} with a superseded status.`
+        : isHighConfidence
+        ? `Hybrid retrieval matched product intent, indexed keywords, product coverage and standard metadata for ${std.standardNumber}.`
+        : `Hybrid retrieval found a related indexed BIS standard, but product-specific confidence is not high enough for an unrestricted recommendation.`,
+
     decomposedTasks,
-    followUpQuestions: followUps || undefined,
-    disclaimer: 'This assistant provides guidance based on retrieved sources and is not a replacement for official BIS decisions.',
-    isDemoData: isDemoMode
+
+    followUpQuestions:
+      followUps || undefined,
+
+    disclaimer:
+      'This assistant provides guidance based on its indexed sources and is not a replacement for official BIS decisions. Always verify current standards, amendments, QCOs, certification requirements and laboratory recognition through authoritative BIS sources.',
+
+    isDemoData:
+      isDemoMode
   };
 }
